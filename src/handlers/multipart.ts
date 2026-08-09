@@ -1,4 +1,4 @@
-import type { Env, S3Request } from '../types';
+import type { Env, S3Request, ObjectRow, MultipartPartRow } from '../types';
 import { MetadataStore } from '../storage/metadata';
 import { uploadToTelegram, RateLimitError, FileTooLargeError, type UploadResult } from '../telegram/upload';
 import { downloadFromTelegram } from '../telegram/download';
@@ -9,7 +9,7 @@ import { readBody } from './put-object';
 import { deleteDerivatives, deleteChunks } from './delete-object';
 import { purgeCdnCache, purgeR2Cache } from './get-object';
 import { initiateMultipartXml, completeMultipartXml, listPartsXml, listMultipartUploadsXml, copyPartResultXml, xmlResponse, errorResponse } from '../xml/builder';
-import { BOT_API_GETFILE_LIMIT, VPS_SINGLE_FILE_MAX, S3_MIN_PART_SIZE, S3_MAX_KEYS_DEFAULT, S3_MAX_PART_NUMBER } from '../constants';
+import { BOT_API_GETFILE_LIMIT, VPS_SINGLE_FILE_MAX, S3_MIN_PART_SIZE, S3_MAX_KEYS_DEFAULT, S3_MAX_PART_NUMBER, CHUNKED_SENTINEL } from '../constants';
 import { VpsClient } from '../media/vps-client';
 import { parseCompleteMultipart } from '../xml/parser';
 import {
@@ -231,14 +231,15 @@ export async function handleCompleteMultipartUpload(s3: S3Request, env: Env, ctx
 
   const totalSize = sortedParts.reduce((s, p) => s + p.size, 0);
 
-  // Size limit check
-  const maxSize = env.VPS_URL ? VPS_SINGLE_FILE_MAX : BOT_API_GETFILE_LIMIT;
-  if (totalSize > maxSize) {
-    const limitStr = env.VPS_URL ? '2GB' : '20MB';
-    return errorResponse(400, 'EntityTooLarge', `Combined size exceeds ${limitStr} limit.`);
+  // Size limit check. With VPS configured, objects larger than a single 2GB
+  // Telegram file are split into multiple <=2GB chunks (see chunked path below).
+  // Without VPS the hard cap is 20MB (Bot API getFile limit), same as before.
+  if (!env.VPS_URL && totalSize > BOT_API_GETFILE_LIMIT) {
+    return errorResponse(400, 'EntityTooLarge', 'Combined size exceeds 20MB limit.');
   }
+  const useChunked = !!env.VPS_URL && totalSize > VPS_SINGLE_FILE_MAX;
 
-  let uploadResult: UploadResult;
+  let uploadResult: UploadResult | null = null;
   let etag: string;
 
   // Check if upload has encryption metadata (SSE-C or SSE-S3)
@@ -266,7 +267,47 @@ export async function handleCompleteMultipartUpload(s3: S3Request, env: Env, ctx
     } catch { /* ignore */ }
   }
 
-  if (totalSize <= BOT_API_GETFILE_LIMIT) {
+  // Encryption options shared by every VPS consolidate call (single file or per-chunk)
+  const sseOptions: { sseKeyBase64?: string; sseS3KeyBase64?: string } = {};
+  if (uploadSseKeyBase64) sseOptions.sseKeyBase64 = uploadSseKeyBase64;
+  else if (uploadUseSseS3 && env.SSE_MASTER_KEY) sseOptions.sseS3KeyBase64 = env.SSE_MASTER_KEY;
+
+  // Chunk descriptors (only populated on the chunked path)
+  let chunkList: Array<{ chunkIndex: number; offset: number; size: number; tgChatId: string; tgMessageId: number; tgFileId: string }> | null = null;
+
+  if (useChunked) {
+    // >2GB: split the sorted parts into batches each <=2GB and consolidate every
+    // batch into its own Telegram file. Each S3 part is already <=2GB (enforced at
+    // UploadPart), so grouping whole parts never overflows a chunk.
+    const batches = groupPartsIntoChunks(sortedParts, VPS_SINGLE_FILE_MAX);
+    const created: Array<{ chunkIndex: number; offset: number; size: number; tgChatId: string; tgMessageId: number; tgFileId: string }> = [];
+    let chunkOffset = 0;
+    try {
+      for (let i = 0; i < batches.length; i++) {
+        const batch = batches[i];
+        const batchSize = batch.reduce((s, p) => s + p.size, 0);
+        const r = await consolidateViaVps(
+          batch, bucket.tg_chat_id,
+          `${upload.key}.chunk${i.toString().padStart(4, '0')}`,
+          upload.content_type || 'application/octet-stream',
+          env, bucket.tg_topic_id, sseOptions,
+        );
+        created.push({
+          chunkIndex: i, offset: chunkOffset, size: batchSize,
+          tgChatId: r.tgChatId, tgMessageId: r.tgMessageId, tgFileId: r.tgFileId,
+        });
+        chunkOffset += batchSize;
+      }
+    } catch (e) {
+      // Roll back TG messages for chunks created so far, plus all uploaded parts
+      ctx.waitUntil(cleanupParts(created.map(c => ({ tg_chat_id: c.tgChatId, tg_message_id: c.tgMessageId })), env));
+      ctx.waitUntil(cleanupParts(sortedParts, env));
+      await store.deleteMultipartUpload(uploadId);
+      throw e;
+    }
+    chunkList = created;
+    etag = await computeMultipartEtag(sortedParts.map(p => p.etag));
+  } else if (totalSize <= BOT_API_GETFILE_LIMIT) {
     // <=20MB: consolidate in Worker memory
     const combined = new Uint8Array(totalSize);
     const downloads = await Promise.all(
@@ -308,12 +349,8 @@ export async function handleCompleteMultipartUpload(s3: S3Request, env: Env, ctx
       throw e;
     }
   } else {
-    // >20MB: delegate consolidation to VPS (with optional encryption)
+    // 20MB - 2GB: delegate consolidation to VPS (with optional encryption)
     try {
-      const sseOptions: { sseKeyBase64?: string; sseS3KeyBase64?: string } = {};
-      if (uploadSseKeyBase64) sseOptions.sseKeyBase64 = uploadSseKeyBase64;
-      else if (uploadUseSseS3 && env.SSE_MASTER_KEY) sseOptions.sseS3KeyBase64 = env.SSE_MASTER_KEY;
-
       const result = await consolidateViaVps(sortedParts, bucket.tg_chat_id, upload.key, upload.content_type || 'application/octet-stream', env, bucket.tg_topic_id, sseOptions);
       uploadResult = result;
       // S3 multipart ETag: computed from part ETags, not content hash
@@ -325,37 +362,63 @@ export async function handleCompleteMultipartUpload(s3: S3Request, env: Env, ctx
     }
   }
 
-  const oldObj = await store.putObject({
-    bucket: upload.bucket,
-    key: upload.key,
-    size: totalSize,
-    etag,
-    contentType: upload.content_type || 'application/octet-stream',
-    tgChatId: uploadResult.tgChatId,
-    tgMessageId: uploadResult.tgMessageId,
-    tgFileId: uploadResult.tgFileId,
-    tgFileUniqueId: uploadResult.tgFileUniqueId,
-    userMetadata: (() => { try { return upload.user_metadata ? JSON.parse(upload.user_metadata) : undefined; } catch { return undefined; } })(),
-    systemMetadata: (() => {
-      // Merge user-defined system metadata with internal part sizes for GetObject partNumber support
-      let base: Record<string, string> = {};
-      if (upload.system_metadata) { try { base = JSON.parse(upload.system_metadata); } catch { /* ignore corrupt */ } }
-      base['_mp_part_sizes'] = JSON.stringify(sortedParts.map(p => p.size));
-      return base;
-    })(),
-  });
+  // Shared metadata for the destination object row
+  const userMetadata = (() => { try { return upload.user_metadata ? JSON.parse(upload.user_metadata) : undefined; } catch { return undefined; } })();
+  const systemMetadata = (() => {
+    // Merge user-defined system metadata with internal part sizes for GetObject partNumber support
+    let base: Record<string, string> = {};
+    if (upload.system_metadata) { try { base = JSON.parse(upload.system_metadata); } catch { /* ignore corrupt */ } }
+    base['_mp_part_sizes'] = JSON.stringify(sortedParts.map(p => p.size));
+    return base;
+  })();
 
-  // Async cleanup: delete ALL part messages (including skipped ones)
-  ctx.waitUntil(cleanupParts(dbParts, env));
+  let oldObj: ObjectRow | null;
+  if (chunkList) {
+    // Chunked object: atomically replace the chunk map + object row, then clean up
+    // the previous object's TG messages (its chunks, or its single file).
+    const { oldObj: prev, oldChunks } = await store.putChunkedObject({
+      bucket: upload.bucket, key: upload.key, size: totalSize, etag,
+      contentType: upload.content_type || 'application/octet-stream',
+      tgChatId: bucket.tg_chat_id, userMetadata, systemMetadata,
+    }, chunkList);
+    oldObj = prev;
 
-  // Async cleanup: delete old TG message + stale derivatives if destination was overwritten
-  if (oldObj && oldObj.tg_file_id !== '__zero__' && oldObj.tg_file_id !== uploadResult.tgFileId) {
-    const tg = new TelegramClient(env);
-    ctx.waitUntil(tg.deleteMessage(oldObj.tg_chat_id, oldObj.tg_message_id).then(() => {}).catch(() => {}));
-  }
-  if (oldObj) {
-    ctx.waitUntil(deleteDerivatives(upload.bucket, upload.key, env, store));
-    ctx.waitUntil(deleteChunks(upload.bucket, upload.key, env, store));
+    ctx.waitUntil(cleanupParts(dbParts, env));
+    if (oldChunks.length > 0) ctx.waitUntil(cleanupParts(oldChunks, env));
+    // Previous object was a single Telegram file: delete its message
+    if (oldObj && oldObj.tg_file_id !== '__zero__' && oldObj.tg_file_id !== CHUNKED_SENTINEL && oldObj.tg_message_id !== 0) {
+      const tg = new TelegramClient(env);
+      ctx.waitUntil(tg.deleteMessage(oldObj.tg_chat_id, oldObj.tg_message_id).then(() => {}).catch(() => {}));
+    }
+    if (oldObj) ctx.waitUntil(deleteDerivatives(upload.bucket, upload.key, env, store));
+  } else {
+    oldObj = await store.putObject({
+      bucket: upload.bucket,
+      key: upload.key,
+      size: totalSize,
+      etag,
+      contentType: upload.content_type || 'application/octet-stream',
+      tgChatId: uploadResult!.tgChatId,
+      tgMessageId: uploadResult!.tgMessageId,
+      tgFileId: uploadResult!.tgFileId,
+      tgFileUniqueId: uploadResult!.tgFileUniqueId,
+      userMetadata,
+      systemMetadata,
+    });
+
+    // Async cleanup: delete ALL part messages (including skipped ones)
+    ctx.waitUntil(cleanupParts(dbParts, env));
+
+    // Async cleanup: delete old TG message + stale derivatives if destination was overwritten
+    if (oldObj && oldObj.tg_file_id !== '__zero__' && oldObj.tg_file_id !== CHUNKED_SENTINEL && oldObj.tg_file_id !== uploadResult!.tgFileId && oldObj.tg_message_id !== 0) {
+      const tg = new TelegramClient(env);
+      ctx.waitUntil(tg.deleteMessage(oldObj.tg_chat_id, oldObj.tg_message_id).then(() => {}).catch(() => {}));
+    }
+    if (oldObj) {
+      ctx.waitUntil(deleteDerivatives(upload.bucket, upload.key, env, store));
+      // Previous object may have been chunked: remove its orphaned chunk messages/rows
+      ctx.waitUntil(deleteChunks(upload.bucket, upload.key, env, store));
+    }
   }
 
   // Purge CDN + R2 cache for destination key (consistent with PutObject/CopyObject)
@@ -453,6 +516,28 @@ export async function handleListMultipartUploads(s3: S3Request, env: Env): Promi
     nextKeyMarker: result.nextKeyMarker, nextUploadIdMarker: result.nextUploadIdMarker,
     encodingType,
   }));
+}
+
+/**
+ * Greedily group parts into batches, each summing to <= maxChunkSize, preserving
+ * order. Every part is already <= maxChunkSize (UploadPart enforces the single-file
+ * limit), so a part always fits in a fresh batch and no batch ever overflows.
+ */
+function groupPartsIntoChunks(parts: MultipartPartRow[], maxChunkSize: number): MultipartPartRow[][] {
+  const batches: MultipartPartRow[][] = [];
+  let current: MultipartPartRow[] = [];
+  let currentSize = 0;
+  for (const p of parts) {
+    if (current.length > 0 && currentSize + p.size > maxChunkSize) {
+      batches.push(current);
+      current = [];
+      currentSize = 0;
+    }
+    current.push(p);
+    currentSize += p.size;
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
 }
 
 async function consolidateViaVps(

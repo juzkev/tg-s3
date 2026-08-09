@@ -4,6 +4,11 @@ export const BOT_API_GETFILE_LIMIT = 20 * 1024 * 1024; // 20MB: Bot API getFile 
 // VPS Local Bot API limits
 export const VPS_SINGLE_FILE_MAX = 2 * 1024 * 1024 * 1024; // 2GB: Local Bot API single file max
 
+// Sentinel stored in objects.tg_file_id marking an object whose bytes are split
+// across multiple <=2GB Telegram files ("chunks"), tracked in the chunks table.
+// Mirrors the existing '__zero__' sentinel convention for empty objects.
+export const CHUNKED_SENTINEL = '__chunked__';
+
 // S3 limits
 export const S3_MAX_KEYS_DEFAULT = 1000;
 export const S3_MAX_PART_NUMBER = 10000;

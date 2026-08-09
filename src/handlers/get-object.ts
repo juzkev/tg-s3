@@ -1,11 +1,11 @@
-import type { Env, S3Request, ObjectRow, BucketRow } from '../types';
+import type { Env, S3Request, ObjectRow, BucketRow, ChunkRow } from '../types';
 import { MetadataStore } from '../storage/metadata';
 import { downloadFromTelegram } from '../telegram/download';
 import { uploadToTelegram } from '../telegram/upload';
 import { computeEtag } from '../utils/crypto';
 import { parseRange, isImageContentType, etagMatches, strip304Headers, buildResponseHeaders } from '../utils/headers';
 import { errorResponse } from '../xml/builder';
-import { BOT_API_GETFILE_LIMIT, R2_CACHE_MIN_SIZE, R2_CACHE_MAX_SIZE, CACHE_CONTROL_IMMUTABLE } from '../constants';
+import { BOT_API_GETFILE_LIMIT, R2_CACHE_MIN_SIZE, R2_CACHE_MAX_SIZE, CACHE_CONTROL_IMMUTABLE, CHUNKED_SENTINEL } from '../constants';
 import { VpsClient } from '../media/vps-client';
 import { parseSseCHeaders, validateKeyMd5, decrypt, isEncrypted, getStoredKeyMd5, addSseResponseHeaders, SseCError, isEncryptedS3, decryptS3, addSseS3ResponseHeaders } from '../utils/sse';
 
@@ -138,7 +138,15 @@ export async function handleGetObject(s3: S3Request, env: Env, ctx?: ExecutionCo
   // Handle GetObject with partNumber (return a specific part of a multipart-uploaded object)
   const partNumberParam = s3.query.get('partNumber');
   if (partNumberParam) {
-    return handlePartNumberGet(s3, obj, headers, parseInt(partNumberParam, 10), env, sseParams, objEncryptedS3);
+    return handlePartNumberGet(s3, obj, headers, parseInt(partNumberParam, 10), env, sseParams, objEncryptedS3, store);
+  }
+
+  // Chunked objects (>2GB, bytes split across multiple TG files): serve via the chunk
+  // map. Checked before image-variant/cache/size branches since there is no single
+  // tg_file_id to download and these objects are far larger than any cache threshold.
+  if (obj.tg_file_id === CHUNKED_SENTINEL) {
+    const rangeHeader = s3.headers.get('range');
+    return downloadViaChunks(obj, headers, rangeHeader, env, objEncrypted ? sseParams : null, objEncryptedS3, store);
   }
 
   // Auto-convert HEIC/HEIF to web-compatible format (browsers can't display HEIC natively)
@@ -297,6 +305,7 @@ async function handlePartNumberGet(
   partNumber: number, env: Env,
   sseParams: ReturnType<typeof parseSseCHeaders>,
   encryptedS3: boolean,
+  store: MetadataStore,
 ): Promise<Response> {
   // Extract part sizes from system metadata (stored during CompleteMultipartUpload)
   let partSizes: number[] | undefined;
@@ -320,6 +329,20 @@ async function handlePartNumberGet(
   const end = start + partSize - 1;
 
   const needsDecrypt = !!(sseParams || (encryptedS3 && env.SSE_MASTER_KEY));
+
+  // Chunked object: the part's object-relative range may span multiple TG chunks
+  if (obj.tg_file_id === CHUNKED_SENTINEL) {
+    if (!env.VPS_URL) return errorResponse(503, 'ServiceUnavailable', 'Chunked object requires VPS proxy which is not configured.');
+    const chunks = await store.getChunks(obj.bucket, obj.key);
+    if (chunks.length === 0) return errorResponse(500, 'InternalError', 'Chunk map missing for chunked object.');
+    const keyBase64 = sseParams ? sseParams.keyBase64 : (encryptedS3 && env.SSE_MASTER_KEY ? env.SSE_MASTER_KEY : null);
+    const vps = new VpsClient(env);
+    const selected = selectChunksForRange(chunks, start, end);
+    const thunks = selected.map(sel => chunkThunk(vps, sel.chunk, sel.localStart, sel.localEnd, needsDecrypt, keyBase64));
+    return buildChunkResponse(206, partSize, `bytes ${start}-${end}/${obj.size}`, {
+      ...headers, 'x-amz-mp-parts-count': partSizes.length.toString(),
+    }, thunks);
+  }
 
   // Download and serve the part range
   let data: ArrayBuffer;
@@ -451,6 +474,149 @@ async function downloadViaVps(
   } catch {
     return errorResponse(503, 'ServiceUnavailable', 'Storage backend temporarily unavailable.');
   }
+}
+
+// ── Chunked object serving (>2GB objects split across multiple TG files) ──
+
+interface ChunkSelection { chunk: ChunkRow; localStart: number; localEnd: number; }
+
+/**
+ * Given the ordered chunk map and an object-relative byte range [start, end]
+ * (inclusive), return each overlapping chunk with the sub-range translated into
+ * that chunk's own local byte offsets. A range may span multiple chunks.
+ */
+function selectChunksForRange(chunks: ChunkRow[], start: number, end: number): ChunkSelection[] {
+  const selected: ChunkSelection[] = [];
+  for (const c of chunks) {
+    const cStart = c.offset;
+    const cEnd = c.offset + c.size - 1;
+    if (cEnd < start || cStart > end) continue; // no overlap
+    selected.push({
+      chunk: c,
+      localStart: Math.max(start, cStart) - cStart,
+      localEnd: Math.min(end, cEnd) - cStart,
+    });
+  }
+  return selected;
+}
+
+/**
+ * Build a lazy fetcher for one chunk's [localStart, localEnd] byte sub-range.
+ * Encrypted chunks are decrypted VPS-side (get-decrypt over the chunk's plaintext
+ * offsets); plaintext chunks use the passthrough range endpoint. A sub-range that
+ * covers the whole chunk uses the cheaper full-file endpoint.
+ */
+function chunkThunk(
+  vps: VpsClient, chunk: ChunkRow, localStart: number, localEnd: number,
+  needsDecrypt: boolean, keyBase64: string | null,
+): () => Promise<ReadableStream<Uint8Array>> {
+  const wholeChunk = localStart === 0 && localEnd === chunk.size - 1;
+  return async () => {
+    let res: Response;
+    if (needsDecrypt) {
+      res = wholeChunk
+        ? await vps.proxyGetDecrypt(chunk.tg_file_id, keyBase64!)
+        : await vps.proxyGetDecrypt(chunk.tg_file_id, keyBase64!, localStart, localEnd);
+    } else {
+      res = wholeChunk
+        ? await vps.proxyGet(chunk.tg_file_id)
+        : await vps.proxyRange(chunk.tg_file_id, localStart, localEnd);
+    }
+    if (!res.body) throw new Error(`Chunk ${chunk.chunk_index} returned an empty body`);
+    return res.body;
+  };
+}
+
+/**
+ * Concatenate chunk streams into one, fetching each subsequent chunk lazily only
+ * once the previous one is fully consumed (no Worker memory buffering). The first
+ * stream is already resolved so a mid-stream backend failure surfaces per chunk.
+ */
+function concatChunkStream(
+  first: ReadableStream<Uint8Array>,
+  rest: Array<() => Promise<ReadableStream<Uint8Array>>>,
+): ReadableStream<Uint8Array> {
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = first.getReader();
+  let idx = 0;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      while (true) {
+        if (!reader) {
+          if (idx >= rest.length) { controller.close(); return; }
+          try {
+            reader = (await rest[idx++]()).getReader();
+          } catch (e) { controller.error(e as Error); return; }
+        }
+        try {
+          const { done, value } = await reader.read();
+          if (done) { reader.releaseLock(); reader = null; continue; }
+          controller.enqueue(value);
+          return;
+        } catch (e) { controller.error(e as Error); return; }
+      }
+    },
+    async cancel(reason) {
+      if (reader) { try { await reader.cancel(reason); } catch { /* ignore */ } }
+    },
+  });
+}
+
+/**
+ * Assemble a streaming response from per-chunk fetch thunks. The first chunk is
+ * fetched eagerly so a backend failure yields a clean 503 (headers not yet sent)
+ * instead of a truncated body.
+ */
+async function buildChunkResponse(
+  status: number, contentLength: number, contentRange: string | null,
+  headers: Record<string, string>,
+  thunks: Array<() => Promise<ReadableStream<Uint8Array>>>,
+): Promise<Response> {
+  if (thunks.length === 0) {
+    return new Response(new ArrayBuffer(0), { status, headers: { ...headers, 'Content-Length': '0' } });
+  }
+  let firstBody: ReadableStream<Uint8Array>;
+  try {
+    firstBody = await thunks[0]();
+  } catch {
+    return errorResponse(503, 'ServiceUnavailable', 'Storage backend temporarily unavailable.');
+  }
+  const body = concatChunkStream(firstBody, thunks.slice(1));
+  const h: Record<string, string> = { ...headers, 'Content-Length': contentLength.toString() };
+  if (contentRange) h['Content-Range'] = contentRange;
+  return new Response(body, { status, headers: h });
+}
+
+export async function downloadViaChunks(
+  obj: ObjectRow, headers: Record<string, string>, rangeHeader: string | null,
+  env: Env, sseParams: ReturnType<typeof parseSseCHeaders>, encryptedS3: boolean,
+  store: MetadataStore,
+): Promise<Response> {
+  if (!env.VPS_URL) {
+    return errorResponse(503, 'ServiceUnavailable', 'File is chunked and requires VPS proxy which is not configured.');
+  }
+  const chunks = await store.getChunks(obj.bucket, obj.key);
+  if (chunks.length === 0) {
+    return errorResponse(500, 'InternalError', 'Chunk map missing for chunked object.');
+  }
+  const vps = new VpsClient(env);
+  const needsDecrypt = !!(sseParams || (encryptedS3 && env.SSE_MASTER_KEY));
+  const keyBase64 = sseParams ? sseParams.keyBase64 : (encryptedS3 && env.SSE_MASTER_KEY ? env.SSE_MASTER_KEY : null);
+
+  if (rangeHeader) {
+    const range = parseRange(rangeHeader, obj.size);
+    if (range === 'unsatisfiable') {
+      return new Response(null, { status: 416, headers: { ...headers, 'Content-Range': `bytes */${obj.size}` } });
+    }
+    if (range) {
+      const selected = selectChunksForRange(chunks, range.start, range.end);
+      const thunks = selected.map(sel => chunkThunk(vps, sel.chunk, sel.localStart, sel.localEnd, needsDecrypt, keyBase64));
+      return buildChunkResponse(206, range.end - range.start + 1, `bytes ${range.start}-${range.end}/${obj.size}`, headers, thunks);
+    }
+  }
+
+  // Full object: stream every chunk in order
+  const thunks = chunks.map(c => chunkThunk(vps, c, 0, c.size - 1, needsDecrypt, keyBase64));
+  return buildChunkResponse(200, obj.size, null, headers, thunks);
 }
 
 async function handleImageVariant(
