@@ -164,3 +164,22 @@ describe('selectChunksForRange', () => {
     ]);
   });
 });
+
+describe('VPS_SINGLE_FILE_MAX', () => {
+  it('stays within Telegram\'s 4000 x 512KB big-file upload ceiling', async () => {
+    const { VPS_SINGLE_FILE_MAX } = await import('../src/constants');
+    const TG_MAX_UPLOAD = 4000 * 512 * 1024; // 2,097,152,000 bytes ("2000 MB")
+    // A larger value lets chunking build chunks Telegram rejects with
+    // "Bad Request: FILE_PARTS_INVALID" (2GiB is ~48MiB over the limit).
+    expect(VPS_SINGLE_FILE_MAX).toBeLessThanOrEqual(TG_MAX_UPLOAD);
+    expect(VPS_SINGLE_FILE_MAX).toBeGreaterThan(1024 * 1024 * 1024); // still >1GiB
+  });
+
+  it('never groups parts into a chunk Telegram would reject', async () => {
+    const { VPS_SINGLE_FILE_MAX } = await import('../src/constants');
+    const parts = Array.from({ length: 12 }, () => ({ size: 300 * 1024 * 1024 }));
+    for (const batch of groupPartsIntoChunks(parts, VPS_SINGLE_FILE_MAX)) {
+      expect(batch.reduce((s, p) => s + p.size, 0)).toBeLessThanOrEqual(4000 * 512 * 1024);
+    }
+  });
+});

@@ -2,7 +2,12 @@
 export const BOT_API_GETFILE_LIMIT = 20 * 1024 * 1024; // 20MB: Bot API getFile download max (upload aligned to this)
 
 // VPS Local Bot API limits
-export const VPS_SINGLE_FILE_MAX = 2 * 1024 * 1024 * 1024; // 2GB: Local Bot API single file max
+// 2000MB (NOT 2GiB): Local Bot API single file max. Telegram uploads big files as
+// at most 4000 MTProto parts of 512KB = 2,097,152,000 bytes. Anything larger is
+// rejected with "Bad Request: FILE_PARTS_INVALID" — a 2GiB (2,147,483,648) file is
+// ~48MiB over the ceiling and fails. Chunk sizing derives from this constant, so
+// setting it to 2GiB would let chunked uploads build chunks Telegram refuses.
+export const VPS_SINGLE_FILE_MAX = 2000 * 1024 * 1024;
 
 // Sentinel stored in objects.tg_file_id marking an object whose bytes are split
 // across multiple <=2GB Telegram files ("chunks"), tracked in the chunks table.

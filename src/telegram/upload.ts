@@ -23,7 +23,7 @@ export async function uploadToTelegram(
   const maxSize = env.VPS_URL ? VPS_SINGLE_FILE_MAX : BOT_API_GETFILE_LIMIT;
 
   if (size > maxSize) {
-    const limitStr = env.VPS_URL ? '2GB' : '20MB';
+    const limitStr = env.VPS_URL ? '2000MB' : '20MB';
     throw new FileTooLargeError(size, maxSize, limitStr);
   }
 

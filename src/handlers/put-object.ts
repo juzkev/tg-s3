@@ -99,7 +99,7 @@ export async function handlePutObject(s3: S3Request, env: Env, ctx: ExecutionCon
 
   if (estimatedSize > BOT_API_GETFILE_LIMIT && env.VPS_URL && !isChunked && s3.body) {
     if (estimatedSize > VPS_SINGLE_FILE_MAX) {
-      return errorResponse(400, 'EntityTooLarge', `File size exceeds maximum 2GB limit.`);
+      return errorResponse(400, 'EntityTooLarge', `File size exceeds maximum 2000MB limit.`);
     }
     return handleLargePutViaVps(
       s3, env, ctx, store, bucket, oldObj,

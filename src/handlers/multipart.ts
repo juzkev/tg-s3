@@ -137,7 +137,7 @@ export async function handleUploadPart(s3: S3Request, env: Env, ctx: ExecutionCo
 
   if (partEstimatedSize > BOT_API_GETFILE_LIMIT && env.VPS_URL && !partIsAwsChunked && !partHasRealHash && s3.body) {
     if (partEstimatedSize > VPS_SINGLE_FILE_MAX) {
-      return errorResponse(400, 'EntityTooLarge', 'Part size exceeds the 2GB limit.');
+      return errorResponse(400, 'EntityTooLarge', 'Part size exceeds the 2000MB limit.');
     }
     const vps = new VpsClient(env);
     const partMd5 = s3.headers.get('content-md5') || undefined;
