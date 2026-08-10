@@ -8,11 +8,14 @@
     "deploy:docker": "./deploy.sh",
     "deploy:vps": "./deploy.sh --vps",
     "db:init": "wrangler d1 execute tg-s3-db --local --file=src/storage/schema.sql",
-    "db:init:remote": "wrangler d1 execute tg-s3-db --remote --file=src/storage/schema.sql"
+    "db:init:remote": "wrangler d1 execute tg-s3-db --remote --file=src/storage/schema.sql",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260101.0",
     "typescript": "^5.7.0",
+    "vitest": "^2.1.9",
     "wrangler": "^4.0.0"
   }
 }

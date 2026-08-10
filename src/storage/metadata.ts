@@ -1,4 +1,5 @@
 import type { Env, ObjectRow, BucketRow, MultipartUploadRow, MultipartPartRow, ShareTokenRow, ChunkRow, CredentialRow } from '../types';
+import { CHUNKED_SENTINEL } from '../constants';
 
 // S3 timestamps have second precision; truncate milliseconds to avoid
 // If-Modified-Since comparison failures (HTTP dates lack ms component)
@@ -474,6 +475,65 @@ export class MetadataStore {
 
   // --- Chunks ---
 
+  /**
+   * Persist an object whose bytes are split across multiple <=2GB Telegram files.
+   * The objects row stores the CHUNKED_SENTINEL in tg_file_id and tg_message_id=0
+   * (so single-message cleanup paths skip it); the real per-chunk TG messages live
+   * in the chunks table. Runs as a single atomic batch: replaces any prior chunk
+   * map for this key, upserts the object row, inserts the new chunks, and adjusts
+   * bucket stats. Returns the previous object row and chunk rows (if any) so the
+   * caller can delete their now-orphaned TG messages.
+   */
+  async putChunkedObject(obj: {
+    bucket: string; key: string; size: number; etag: string; contentType: string;
+    tgChatId: string;
+    userMetadata?: Record<string, string>;
+    systemMetadata?: Record<string, string>;
+  }, chunks: Array<{
+    chunkIndex: number; offset: number; size: number;
+    tgChatId: string; tgMessageId: number; tgFileId: string;
+  }>): Promise<{ oldObj: ObjectRow | null; oldChunks: ChunkRow[] }> {
+    const now = isoNowSeconds();
+    const metaJson = obj.userMetadata && Object.keys(obj.userMetadata).length > 0
+      ? JSON.stringify(obj.userMetadata) : null;
+    const sysMetaJson = obj.systemMetadata && Object.keys(obj.systemMetadata).length > 0
+      ? JSON.stringify(obj.systemMetadata) : null;
+
+    const existing = await this.getObject(obj.bucket, obj.key);
+    const oldChunks = await this.getChunks(obj.bucket, obj.key);
+
+    const stmts: D1PreparedStatement[] = [];
+    // Replace any prior chunk map (handles chunked->chunked overwrite with fewer chunks)
+    stmts.push(this.db.prepare('DELETE FROM chunks WHERE bucket = ? AND key = ?').bind(obj.bucket, obj.key));
+    stmts.push(this.db.prepare(`
+      INSERT INTO objects (bucket, key, size, etag, content_type, last_modified, tg_chat_id, tg_message_id, tg_file_id, tg_file_unique_id, user_metadata, system_metadata, derived_from)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(bucket, key) DO UPDATE SET
+        size=excluded.size, etag=excluded.etag, content_type=excluded.content_type,
+        last_modified=excluded.last_modified, tg_chat_id=excluded.tg_chat_id,
+        tg_message_id=excluded.tg_message_id, tg_file_id=excluded.tg_file_id,
+        tg_file_unique_id=excluded.tg_file_unique_id,
+        user_metadata=excluded.user_metadata, system_metadata=excluded.system_metadata,
+        derived_from=excluded.derived_from
+    `).bind(
+      obj.bucket, obj.key, obj.size, obj.etag, obj.contentType, now,
+      obj.tgChatId, 0, CHUNKED_SENTINEL, CHUNKED_SENTINEL,
+      metaJson, sysMetaJson, null,
+    ));
+    for (const c of chunks) {
+      stmts.push(this.db.prepare(
+        `INSERT INTO chunks (bucket, key, chunk_index, offset, size, tg_chat_id, tg_message_id, tg_file_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(obj.bucket, obj.key, c.chunkIndex, c.offset, c.size, c.tgChatId, c.tgMessageId, c.tgFileId));
+    }
+    stmts.push(existing
+      ? this.db.prepare('UPDATE buckets SET total_size = MAX(0, total_size + ?), object_count = MAX(0, object_count + ?) WHERE name = ?').bind(obj.size - existing.size, 0, obj.bucket)
+      : this.db.prepare('UPDATE buckets SET total_size = MAX(0, total_size + ?), object_count = MAX(0, object_count + ?) WHERE name = ?').bind(obj.size, 1, obj.bucket));
+
+    await this.db.batch(stmts);
+    return { oldObj: existing, oldChunks };
+  }
+
   async putChunk(chunk: ChunkRow): Promise<void> {
     await this.db.prepare(
       `INSERT INTO chunks (bucket, key, chunk_index, offset, size, tg_chat_id, tg_message_id, tg_file_id)
@@ -670,8 +730,11 @@ export class MetadataStore {
   }
 
   async sampleObjects(limit = 10): Promise<ObjectRow[]> {
+    // Exclude sentinel-backed objects: '__zero__' has no TG file, and '__chunked__'
+    // objects have no single tg_file_id (their bytes live in the chunks table), so a
+    // getFile() consistency probe on the sentinel would 400 and wrongly delete them.
     const result = await this.db.prepare(
-      'SELECT * FROM objects WHERE tg_file_id != \'__zero__\' ORDER BY RANDOM() LIMIT ?'
+      "SELECT * FROM objects WHERE tg_file_id != '__zero__' AND tg_file_id != '__chunked__' ORDER BY RANDOM() LIMIT ?"
     ).bind(limit).all<ObjectRow>();
     return result.results;
   }

@@ -4,7 +4,8 @@ import { createShareToken, validateShareToken, validateShareTokenWithCookie } fr
 import { renderSharePage, renderPasswordPage, renderExpiredPage } from '../sharing/pages';
 import { downloadFromTelegram } from '../telegram/download';
 import { errorResponse } from '../xml/builder';
-import { BOT_API_GETFILE_LIMIT, CACHE_CONTROL_DEFAULT } from '../constants';
+import { BOT_API_GETFILE_LIMIT, CACHE_CONTROL_DEFAULT, CHUNKED_SENTINEL } from '../constants';
+import { downloadViaChunks } from './get-object';
 import { parseRange } from '../utils/headers';
 import { detectLang } from '../i18n';
 import { signShareSession, timingSafeEqual } from '../utils/crypto';
@@ -294,6 +295,13 @@ async function serveFile(obj: ObjectRow, env: Env, disposition: 'inline' | 'atta
     return new Response(new ArrayBuffer(0), {
       headers: { ...baseHeaders, 'Content-Length': '0' },
     });
+  }
+
+  // Chunked objects (>2GB, split across multiple TG files): serve via the chunk map.
+  // Shares serve stored bytes as-is (like single-file shares), so no per-chunk decrypt.
+  if (obj.tg_file_id === CHUNKED_SENTINEL) {
+    const store = new MetadataStore(env);
+    return downloadViaChunks(obj, baseHeaders, rangeHeader, env, null, false, store);
   }
 
   const range = rangeHeader ? parseRange(rangeHeader, obj.size) : null;

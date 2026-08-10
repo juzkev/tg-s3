@@ -6,6 +6,10 @@ preview_urls = false
 
 [vars]
 S3_REGION = "us-east-1"
+# Parallel per-chunk consolidations when completing a >2GB multipart upload.
+# Default "1" (sequential). Higher values speed up multi-chunk completion but run
+# that many <=2GB VPS temp files / Telegram transfers at once (clamped to 8).
+# CHUNK_CONSOLIDATE_CONCURRENCY = "3"
 
 [[d1_databases]]
 binding = "DB"
