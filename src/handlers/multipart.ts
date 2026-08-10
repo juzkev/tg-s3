@@ -1,5 +1,19 @@
 import type { Env, S3Request, ObjectRow } from '../types';
 import { groupPartsIntoChunks } from '../utils/chunking';
+import { mapWithConcurrency } from '../utils/concurrency';
+import { CHUNK_CONSOLIDATE_CONCURRENCY_MAX } from '../constants';
+
+type ChunkDesc = { chunkIndex: number; offset: number; size: number; tgChatId: string; tgMessageId: number; tgFileId: string };
+
+// Parallel VPS consolidations on completion. Default 1 (sequential): raising it
+// speeds up multi-chunk uploads but each concurrent consolidate holds a <=2GB temp
+// file on the VPS and drives another Telegram transfer, so it is bounded and
+// deployment-tunable via the CHUNK_CONSOLIDATE_CONCURRENCY var.
+function getChunkConcurrency(env: Env): number {
+  const raw = parseInt(env.CHUNK_CONSOLIDATE_CONCURRENCY || '', 10);
+  if (isNaN(raw) || raw < 1) return 1;
+  return Math.min(raw, CHUNK_CONSOLIDATE_CONCURRENCY_MAX);
+}
 import { MetadataStore } from '../storage/metadata';
 import { uploadToTelegram, RateLimitError, FileTooLargeError, type UploadResult } from '../telegram/upload';
 import { downloadFromTelegram } from '../telegram/download';
@@ -325,39 +339,46 @@ export async function handleCompleteMultipartUpload(s3: S3Request, env: Env, ctx
   else if (uploadUseSseS3 && env.SSE_MASTER_KEY) sseOptions.sseS3KeyBase64 = env.SSE_MASTER_KEY;
 
   // Chunk descriptors (only populated on the chunked path)
-  let chunkList: Array<{ chunkIndex: number; offset: number; size: number; tgChatId: string; tgMessageId: number; tgFileId: string }> | null = null;
+  let chunkList: ChunkDesc[] | null = null;
 
   if (useChunked) {
     // >2GB: split the sorted parts into batches each <=2GB and consolidate every
     // batch into its own Telegram file. Each S3 part is already <=2GB (enforced at
-    // UploadPart), so grouping whole parts never overflows a chunk.
+    // UploadPart), so grouping whole parts never overflows a chunk. Offsets are
+    // deterministic from batch sizes, so batches can be consolidated concurrently
+    // (bounded) and their tg-ids filled in by index — order is preserved.
     const batches = groupPartsIntoChunks(sortedParts, VPS_SINGLE_FILE_MAX);
-    const created: Array<{ chunkIndex: number; offset: number; size: number; tgChatId: string; tgMessageId: number; tgFileId: string }> = [];
-    let chunkOffset = 0;
+    let acc = 0;
+    const plan = batches.map((batch) => {
+      const size = batch.reduce((s, p) => s + p.size, 0);
+      const offset = acc;
+      acc += size;
+      return { batch, offset, size };
+    });
+
+    const created: (ChunkDesc | undefined)[] = new Array(plan.length);
     try {
-      for (let i = 0; i < batches.length; i++) {
-        const batch = batches[i];
-        const batchSize = batch.reduce((s, p) => s + p.size, 0);
+      await mapWithConcurrency(plan, getChunkConcurrency(env), async (p, i) => {
         const r = await consolidateViaVps(
-          batch, bucket.tg_chat_id,
+          p.batch, bucket.tg_chat_id,
           `${upload.key}.chunk${i.toString().padStart(4, '0')}`,
           upload.content_type || 'application/octet-stream',
           env, bucket.tg_topic_id, sseOptions,
         );
-        created.push({
-          chunkIndex: i, offset: chunkOffset, size: batchSize,
+        created[i] = {
+          chunkIndex: i, offset: p.offset, size: p.size,
           tgChatId: r.tgChatId, tgMessageId: r.tgMessageId, tgFileId: r.tgFileId,
-        });
-        chunkOffset += batchSize;
-      }
+        };
+      });
     } catch (e) {
       // Roll back TG messages for chunks created so far, plus all uploaded parts
-      ctx.waitUntil(cleanupParts(created.map(c => ({ tg_chat_id: c.tgChatId, tg_message_id: c.tgMessageId })), env));
+      const done = created.filter((c): c is ChunkDesc => !!c);
+      ctx.waitUntil(cleanupParts(done.map(c => ({ tg_chat_id: c.tgChatId, tg_message_id: c.tgMessageId })), env));
       ctx.waitUntil(cleanupParts(sortedParts, env));
       await store.deleteMultipartUpload(uploadId);
       throw e;
     }
-    chunkList = created;
+    chunkList = created as ChunkDesc[];
     etag = await computeMultipartEtag(sortedParts.map(p => p.etag));
   } else if (totalSize <= BOT_API_GETFILE_LIMIT) {
     // <=20MB: consolidate in Worker memory

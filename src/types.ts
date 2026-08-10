@@ -15,6 +15,10 @@ export interface Env {
   // Comma-separated Telegram user IDs allowed to use the bot (e.g. "123456789,987654321")
   // If not set, the bot accepts commands from any user (not recommended for production)
   TG_ADMIN_IDS?: string;
+  // Parallel per-chunk consolidations at multipart completion (default 1 = sequential,
+  // clamped to CHUNK_CONSOLIDATE_CONCURRENCY_MAX). Higher = faster >2GB completion at
+  // the cost of more concurrent VPS temp files and Telegram transfers.
+  CHUNK_CONSOLIDATE_CONCURRENCY?: string;
 }
 
 // D1 row types

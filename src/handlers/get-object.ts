@@ -512,8 +512,11 @@ function chunkThunk(
 }
 
 /**
- * Concatenate chunk streams into one, fetching each subsequent chunk lazily only
- * once the previous one is fully consumed (no Worker memory buffering). The first
+ * Concatenate chunk streams into one. Read-ahead of depth 1: while the current
+ * chunk is being drained, the next chunk's fetch is already in flight, so the
+ * per-chunk round-trip (getFile + range open on the VPS) is hidden instead of
+ * stalling between chunks. Only one chunk is prefetched, so memory stays flat —
+ * at most two chunk streams' bounded internal buffers are live at once. The first
  * stream is already resolved so a mid-stream backend failure surfaces per chunk.
  */
 function concatChunkStream(
@@ -521,15 +524,22 @@ function concatChunkStream(
   rest: Array<() => Promise<ReadableStream<Uint8Array>>>,
 ): ReadableStream<Uint8Array> {
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = first.getReader();
-  let idx = 0;
+  let nextIdx = 0;
+  // Kick off the read-ahead of the next chunk immediately.
+  let ahead: Promise<ReadableStream<Uint8Array>> | null = rest.length > 0 ? rest[nextIdx]() : null;
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       while (true) {
         if (!reader) {
-          if (idx >= rest.length) { controller.close(); return; }
+          if (!ahead) { controller.close(); return; }
+          let stream: ReadableStream<Uint8Array>;
           try {
-            reader = (await rest[idx++]()).getReader();
+            stream = await ahead;
           } catch (e) { controller.error(e as Error); return; }
+          reader = stream.getReader();
+          // Schedule the next read-ahead now, so it overlaps draining this chunk.
+          nextIdx++;
+          ahead = nextIdx < rest.length ? rest[nextIdx]() : null;
         }
         try {
           const { done, value } = await reader.read();
@@ -541,6 +551,8 @@ function concatChunkStream(
     },
     async cancel(reason) {
       if (reader) { try { await reader.cancel(reason); } catch { /* ignore */ } }
+      // Cancel any prefetched-but-unconsumed chunk so its VPS fetch doesn't dangle.
+      if (ahead) { try { await (await ahead).cancel(reason); } catch { /* ignore */ } }
     },
   });
 }
