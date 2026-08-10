@@ -1,4 +1,5 @@
-import type { Env, S3Request, ObjectRow, MultipartPartRow } from '../types';
+import type { Env, S3Request, ObjectRow } from '../types';
+import { groupPartsIntoChunks } from '../utils/chunking';
 import { MetadataStore } from '../storage/metadata';
 import { uploadToTelegram, RateLimitError, FileTooLargeError, type UploadResult } from '../telegram/upload';
 import { downloadFromTelegram } from '../telegram/download';
@@ -516,28 +517,6 @@ export async function handleListMultipartUploads(s3: S3Request, env: Env): Promi
     nextKeyMarker: result.nextKeyMarker, nextUploadIdMarker: result.nextUploadIdMarker,
     encodingType,
   }));
-}
-
-/**
- * Greedily group parts into batches, each summing to <= maxChunkSize, preserving
- * order. Every part is already <= maxChunkSize (UploadPart enforces the single-file
- * limit), so a part always fits in a fresh batch and no batch ever overflows.
- */
-function groupPartsIntoChunks(parts: MultipartPartRow[], maxChunkSize: number): MultipartPartRow[][] {
-  const batches: MultipartPartRow[][] = [];
-  let current: MultipartPartRow[] = [];
-  let currentSize = 0;
-  for (const p of parts) {
-    if (current.length > 0 && currentSize + p.size > maxChunkSize) {
-      batches.push(current);
-      current = [];
-      currentSize = 0;
-    }
-    current.push(p);
-    currentSize += p.size;
-  }
-  if (current.length > 0) batches.push(current);
-  return batches;
 }
 
 async function consolidateViaVps(

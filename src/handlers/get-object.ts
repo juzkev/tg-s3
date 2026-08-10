@@ -8,6 +8,7 @@ import { errorResponse } from '../xml/builder';
 import { BOT_API_GETFILE_LIMIT, R2_CACHE_MIN_SIZE, R2_CACHE_MAX_SIZE, CACHE_CONTROL_IMMUTABLE, CHUNKED_SENTINEL } from '../constants';
 import { VpsClient } from '../media/vps-client';
 import { parseSseCHeaders, validateKeyMd5, decrypt, isEncrypted, getStoredKeyMd5, addSseResponseHeaders, SseCError, isEncryptedS3, decryptS3, addSseS3ResponseHeaders } from '../utils/sse';
+import { selectChunksForRange } from '../utils/chunking';
 
 const MAX_DIRECT_DOWNLOAD = BOT_API_GETFILE_LIMIT;
 
@@ -477,28 +478,8 @@ async function downloadViaVps(
 }
 
 // ── Chunked object serving (>2GB objects split across multiple TG files) ──
-
-interface ChunkSelection { chunk: ChunkRow; localStart: number; localEnd: number; }
-
-/**
- * Given the ordered chunk map and an object-relative byte range [start, end]
- * (inclusive), return each overlapping chunk with the sub-range translated into
- * that chunk's own local byte offsets. A range may span multiple chunks.
- */
-function selectChunksForRange(chunks: ChunkRow[], start: number, end: number): ChunkSelection[] {
-  const selected: ChunkSelection[] = [];
-  for (const c of chunks) {
-    const cStart = c.offset;
-    const cEnd = c.offset + c.size - 1;
-    if (cEnd < start || cStart > end) continue; // no overlap
-    selected.push({
-      chunk: c,
-      localStart: Math.max(start, cStart) - cStart,
-      localEnd: Math.min(end, cEnd) - cStart,
-    });
-  }
-  return selected;
-}
+// Interval selection (selectChunksForRange) lives in ../utils/chunking so it can be
+// unit-tested without pulling in Worker globals.
 
 /**
  * Build a lazy fetcher for one chunk's [localStart, localEnd] byte sub-range.
