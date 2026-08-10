@@ -29,3 +29,26 @@ jobs:
 
       - name: Unit tests
         run: npm test
+
+  # VPS processor (Node/Express). This feature reuses it unmodified, and its
+  # endpoints are pure I/O against a live Telegram Local Bot API server, so there
+  # is no dependency-free logic to unit-test here and no way to exercise it in CI.
+  # We still guard against the realistic failure mode — a syntax error or an
+  # unresolvable dependency slipping into the deployable service.
+  processor:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: processor
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Syntax check
+        run: node --check server.js
