@@ -718,11 +718,15 @@ async function uploadDerivative(job, derivativeName, buffer, contentType) {
 }
 
 async function getFilePath(fileId) {
+  // TIMEOUT_TRANSFER, not TIMEOUT_API: with the Local Bot API, getFile blocks while
+  // the server pulls the whole file from Telegram to its local disk the first time
+  // it is requested. For a ~2GB file that far exceeds the 30s API timeout, which
+  // surfaces as a spurious 500 on the first range/get of a large object.
   const res = await fetch(`${TG_API}/bot${BOT_TOKEN}/getFile`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ file_id: fileId }),
-    signal: AbortSignal.timeout(TIMEOUT_API),
+    signal: AbortSignal.timeout(TIMEOUT_TRANSFER),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => '');
