@@ -50,6 +50,10 @@ services:
       - TEMP_DIR=/tmp/tg-s3
     volumes:
       - processor-data:/tmp/tg-s3
+      # Local Bot API (--local) 模式下 getFile 返回服务端本地绝对路径且 /file/ HTTP 路由返回 501,
+      # processor 必须能直接读取该目录 / With --local, getFile returns absolute paths on the Bot
+      # API server and its HTTP /file/ route answers 501, so the processor must read them directly.
+      - tg-bot-api-data:/var/lib/telegram-bot-api:ro
     deploy:
       resources:
         limits:

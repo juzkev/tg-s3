@@ -87,9 +87,17 @@ app.get('/api/jobs/:id', (req, res) => {
 app.post('/api/proxy/get', async (req, res) => {
   try {
     const { file_id } = req.body;
-    const filePath = await getFilePath(file_id);
-    const url = `${TG_API}/file/bot${BOT_TOKEN}/${filePath}`;
-    const tgRes = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_TRANSFER) });
+    const f = await resolveTgFile(file_id);
+
+    // Local Bot API (--local): stream straight off disk, no HTTP transfer.
+    if (f.local) {
+      res.set('Content-Type', 'application/octet-stream');
+      res.set('Content-Length', String(f.size));
+      await pipeline(createReadStream(f.path), res);
+      return;
+    }
+
+    const tgRes = await fetch(f.url, { signal: AbortSignal.timeout(TIMEOUT_TRANSFER) });
     if (!tgRes.ok) return res.status(502).json({ error: `TG download failed: ${tgRes.status}` });
 
     res.set('Content-Type', tgRes.headers.get('content-type') || 'application/octet-stream');
@@ -178,10 +186,24 @@ app.post('/api/proxy/put', async (req, res) => {
 app.post('/api/proxy/range', async (req, res) => {
   try {
     const { file_id, start, end } = req.body;
-    const filePath = await getFilePath(file_id);
-    const url = `${TG_API}/file/bot${BOT_TOKEN}/${filePath}`;
+    const f = await resolveTgFile(file_id);
 
-    const tgRes = await fetch(url, {
+    // Local Bot API (--local): seek on disk instead of an HTTP range request.
+    if (f.local) {
+      const s = parseInt(start, 10);
+      const e = Math.min(parseInt(end, 10), f.size - 1);
+      if (!Number.isFinite(s) || !Number.isFinite(e) || s < 0 || s > e || s >= f.size) {
+        return res.status(416).json({ error: 'Range not satisfiable' });
+      }
+      res.status(206);
+      res.set('Content-Type', 'application/octet-stream');
+      res.set('Content-Length', String(e - s + 1));
+      res.set('Content-Range', `bytes ${s}-${e}/${f.size}`);
+      await pipeline(createReadStream(f.path, { start: s, end: e }), res);
+      return;
+    }
+
+    const tgRes = await fetch(f.url, {
       headers: { 'Range': `bytes=${start}-${end}` },
       signal: AbortSignal.timeout(TIMEOUT_TRANSFER),
     });
@@ -342,28 +364,34 @@ app.post('/api/proxy/get-decrypt', async (req, res) => {
       return res.status(400).json({ error: 'Missing file_id or key_base64' });
     }
 
-    // 1. Download encrypted file from TG to temp file (streaming, no memory buffering)
-    const filePath = await getFilePath(file_id);
-    const url = `${TG_API}/file/bot${BOT_TOKEN}/${filePath}`;
-    const tgRes = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_TRANSFER) });
-    if (!tgRes.ok) return res.status(502).json({ error: `TG download failed: ${tgRes.status}` });
+    // 1. Obtain the encrypted bytes. With the Local Bot API the file is already on
+    // disk, so read it in place (encSource) instead of copying it to a temp file.
+    // encSource is only unlinked below when it is our own temp file — never the
+    // Bot API's copy.
+    const f = await resolveTgFile(file_id);
+    let encSource = f.local ? f.path : encPath;
 
-    const ws = createWriteStream(encPath);
-    const reader = tgRes.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const ok = ws.write(Buffer.from(value));
-      if (!ok) await new Promise(resolve => ws.once('drain', resolve));
+    if (!f.local) {
+      const tgRes = await fetch(f.url, { signal: AbortSignal.timeout(TIMEOUT_TRANSFER) });
+      if (!tgRes.ok) return res.status(502).json({ error: `TG download failed: ${tgRes.status}` });
+
+      const ws = createWriteStream(encPath);
+      const reader = tgRes.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const ok = ws.write(Buffer.from(value));
+        if (!ok) await new Promise(resolve => ws.once('drain', resolve));
+      }
+      await new Promise((resolve, reject) => { ws.end(resolve); ws.on('error', reject); });
     }
-    await new Promise((resolve, reject) => { ws.end(resolve); ws.on('error', reject); });
 
     // 2. Read IV (first 12 bytes) and auth tag (last 16 bytes) from encrypted file
-    const encStat = await stat(encPath);
+    const encStat = await stat(encSource);
     const encSize = encStat.size;
     if (encSize < 28) return res.status(500).json({ error: 'Encrypted data too short' });
 
-    const fh = await openFile(encPath, 'r');
+    const fh = await openFile(encSource, 'r');
     const ivBuf = Buffer.alloc(12);
     await fh.read(ivBuf, 0, 12, 0);
     const authTagBuf = Buffer.alloc(16);
@@ -377,7 +405,7 @@ app.post('/api/proxy/get-decrypt', async (req, res) => {
     decipher.setAuthTag(authTagBuf);
 
     // Ciphertext is between IV and auth tag
-    const cipherStream = createReadStream(encPath, { start: 12, end: encSize - 17 });
+    const cipherStream = createReadStream(encSource, { start: 12, end: encSize - 17 });
     const decStream = createWriteStream(decPath);
 
     try {
@@ -437,9 +465,20 @@ app.post('/api/proxy/consolidate', async (req, res) => {
     const writeError = new Promise((_, reject) => writeStream.on('error', reject));
 
     for (const fileId of file_ids) {
-      const filePath = await getFilePath(fileId);
-      const url = `${TG_API}/file/bot${BOT_TOKEN}/${filePath}`;
-      const tgRes = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_TRANSFER) });
+      const f = await resolveTgFile(fileId);
+
+      // Local Bot API (--local): read the part off disk, no HTTP transfer.
+      if (f.local) {
+        for await (const value of createReadStream(f.path)) {
+          const buf = Buffer.from(value);
+          hash.update(buf);
+          const ok = writeStream.write(buf);
+          if (!ok) await new Promise(resolve => writeStream.once('drain', resolve));
+        }
+        continue;
+      }
+
+      const tgRes = await fetch(f.url, { signal: AbortSignal.timeout(TIMEOUT_TRANSFER) });
       if (!tgRes.ok) throw new Error(`Download part failed: ${tgRes.status}`);
 
       const reader = tgRes.body.getReader();
@@ -517,12 +556,7 @@ app.post('/api/proxy/consolidate', async (req, res) => {
 app.get('/api/image/resize', async (req, res) => {
   try {
     const { tg_file_id, width, format, quality } = req.query;
-    const filePath = await getFilePath(tg_file_id);
-    const url = `${TG_API}/file/bot${BOT_TOKEN}/${filePath}`;
-    const tgRes = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_TRANSFER) });
-    if (!tgRes.ok) return res.status(502).json({ error: 'TG download failed' });
-
-    const inputBuffer = Buffer.from(await tgRes.arrayBuffer());
+    const inputBuffer = await readTgFileBuffer(tg_file_id);
     let img = sharp(inputBuffer);
 
     if (width) {
@@ -556,12 +590,8 @@ async function processJob(jobId) {
   const job = jobs.get(jobId);
   job.status = 'processing';
 
-  // Download source file from TG
-  const filePath = await getFilePath(job.tg_file_id);
-  const url = `${TG_API}/file/bot${BOT_TOKEN}/${filePath}`;
-  const tgRes = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_TRANSFER) });
-  if (!tgRes.ok) throw new Error(`TG download failed: ${tgRes.status}`);
-  const inputBuffer = Buffer.from(await tgRes.arrayBuffer());
+  // Download source file from TG (local disk when using the Local Bot API)
+  const inputBuffer = await readTgFileBuffer(job.tg_file_id);
 
   const results = [];
 
@@ -694,10 +724,54 @@ async function getFilePath(fileId) {
     body: JSON.stringify({ file_id: fileId }),
     signal: AbortSignal.timeout(TIMEOUT_API),
   });
-  if (!res.ok) throw new Error(`getFile failed: ${res.status}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`getFile failed: ${res.status}${body ? ` ${body.slice(0, 200)}` : ''}`);
+  }
   const data = await res.json();
   if (!data.ok || !data.result?.file_path) throw new Error('No file_path in getFile response');
   return data.result.file_path;
+}
+
+/**
+ * Resolve a tg file_id to a readable source.
+ *
+ * A self-hosted Bot API server started with --local (TELEGRAM_LOCAL=1) returns an
+ * ABSOLUTE filesystem path from getFile and disables its HTTP /file/ route, which
+ * answers 501 — it expects the caller to read the file straight off disk. --local
+ * is also what lifts the 20MB download cap: without it getFile rejects larger
+ * files with "Bad Request: file is too big". Large-file support therefore requires
+ * both --local AND reading from disk; fetching over HTTP cannot work in any
+ * configuration. Reading locally is also cheaper: it skips a full HTTP transfer,
+ * and range reads become a plain seek instead of an HTTP range round-trip.
+ *
+ * Falls back to the HTTP URL when file_path is relative (cloud API, or a
+ * self-hosted server running without --local).
+ */
+async function resolveTgFile(fileId) {
+  const filePath = await getFilePath(fileId);
+  if (filePath.startsWith('/')) {
+    if (!existsSync(filePath)) {
+      throw new Error(
+        `Bot API returned local path ${filePath} but it is not readable here. ` +
+        `Mount the Bot API data directory into this container ` +
+        `(e.g. tg-bot-api-data:/var/lib/telegram-bot-api:ro).`
+      );
+    }
+    const st = await stat(filePath);
+    return { local: true, path: filePath, size: st.size };
+  }
+  return { local: false, url: `${TG_API}/file/bot${BOT_TOKEN}/${filePath}` };
+}
+
+/** Read a tg file fully into a Buffer (local disk or HTTP). For media/image work
+ *  that needs the whole file in memory anyway. */
+async function readTgFileBuffer(fileId) {
+  const f = await resolveTgFile(fileId);
+  if (f.local) return readFile(f.path);
+  const tgRes = await fetch(f.url, { signal: AbortSignal.timeout(TIMEOUT_TRANSFER) });
+  if (!tgRes.ok) throw new Error(`TG download failed: ${tgRes.status}`);
+  return Buffer.from(await tgRes.arrayBuffer());
 }
 
 app.listen(PORT, () => {
