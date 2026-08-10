@@ -108,6 +108,57 @@ export async function handleUploadPart(s3: S3Request, env: Env, ctx: ExecutionCo
   const bucket = await store.getBucket(upload.bucket);
   if (!bucket) return errorResponse(404, 'NoSuchBucket', 'Bucket not found.');
 
+  // Large part: stream the body straight to the VPS (no Worker memory buffering),
+  // lifting the per-part ceiling from ~100MB (buffered) to 2GB. Parts are stored
+  // unencrypted regardless of SSE (the consolidated object is encrypted at
+  // completion), so no key is passed here. Only for UNSIGNED-PAYLOAD parts: a real
+  // x-amz-content-sha256 needs the whole body buffered to verify, and aws-chunked
+  // bodies need de-framing first — both fall through to the buffered path below.
+  const partContentLength = parseInt(s3.headers.get('content-length') || '0', 10);
+  const partDecodedLength = parseInt(s3.headers.get('x-amz-decoded-content-length') || '0', 10);
+  const partEstimatedSize = partDecodedLength || partContentLength;
+  const partSha256 = s3.headers.get('x-amz-content-sha256') || '';
+  const partIsAwsChunked = partSha256.startsWith('STREAMING-');
+  const partHasRealHash = partSha256 !== '' && partSha256 !== 'UNSIGNED-PAYLOAD' && !partIsAwsChunked;
+
+  if (partEstimatedSize > BOT_API_GETFILE_LIMIT && env.VPS_URL && !partIsAwsChunked && !partHasRealHash && s3.body) {
+    if (partEstimatedSize > VPS_SINGLE_FILE_MAX) {
+      return errorResponse(400, 'EntityTooLarge', 'Part size exceeds the 2GB limit.');
+    }
+    const vps = new VpsClient(env);
+    const partMd5 = s3.headers.get('content-md5') || undefined;
+    let vpsRes: Response;
+    try {
+      vpsRes = await vps.proxyPutFull(
+        s3.body,
+        bucket.tg_chat_id,
+        `${upload.key}.part${partNumber.toString().padStart(4, '0')}`,
+        'application/octet-stream',
+        partContentLength,
+        { messageThreadId: bucket.tg_topic_id, contentMd5: partMd5 },
+      );
+    } catch (e) {
+      return errorResponse(502, 'InternalError', `Part upload failed: ${(e as Error).message}`);
+    }
+    const streamed = await vpsRes.json() as {
+      etag: string; tgChatId: string; tgMessageId: number; tgFileId: string; size: number;
+    };
+
+    const prevPart = await store.getMultipartPart(uploadId, partNumber);
+    await store.putMultipartPart({
+      uploadId, partNumber, size: streamed.size, etag: streamed.etag,
+      tgChatId: streamed.tgChatId, tgMessageId: streamed.tgMessageId, tgFileId: streamed.tgFileId,
+    });
+    if (prevPart) ctx.waitUntil(cleanupParts([prevPart], env));
+
+    const streamedHeaders: Record<string, string> = { 'ETag': streamed.etag };
+    if (uploadSseMd5) {
+      streamedHeaders['x-amz-server-side-encryption-customer-algorithm'] = 'AES256';
+      streamedHeaders['x-amz-server-side-encryption-customer-key-MD5'] = uploadSseMd5;
+    }
+    return new Response(null, { status: 200, headers: streamedHeaders });
+  }
+
   // Read part body (handles AWS chunked streaming format transparently)
   const bodyBuf = await readBody(s3);
   if (!bodyBuf || bodyBuf.byteLength === 0) return errorResponse(400, 'MissingContent', 'Request body is empty.');
@@ -535,13 +586,31 @@ async function consolidateViaVps(
   return data as unknown as UploadResult;
 }
 
+// Delete part/chunk TG messages, grouped by chat and batched <=100 per call so
+// completing a large multipart upload spends ~1 subrequest per 100 parts instead
+// of one per part (which would blow the Worker subrequest budget on big objects).
 async function cleanupParts(parts: Array<{ tg_chat_id: string; tg_message_id: number }>, env: Env): Promise<void> {
+  if (parts.length === 0) return;
   const tg = new TelegramClient(env);
-  await Promise.allSettled(parts.map(p =>
-    tg.deleteMessage(p.tg_chat_id, p.tg_message_id).catch(e => {
-      console.warn(`Cleanup: failed to delete part message ${p.tg_message_id}:`, e);
-    })
-  ));
+
+  const byChat = new Map<string, number[]>();
+  for (const p of parts) {
+    if (!p.tg_message_id) continue; // skip sentinel/zero rows
+    const ids = byChat.get(p.tg_chat_id);
+    if (ids) ids.push(p.tg_message_id);
+    else byChat.set(p.tg_chat_id, [p.tg_message_id]);
+  }
+
+  const ops: Promise<unknown>[] = [];
+  for (const [chatId, ids] of byChat) {
+    for (let i = 0; i < ids.length; i += 100) {
+      const batch = ids.slice(i, i + 100);
+      ops.push(tg.deleteMessages(chatId, batch).catch(e => {
+        console.warn(`Cleanup: failed to delete ${batch.length} part message(s) in ${chatId}:`, e);
+      }));
+    }
+  }
+  await Promise.allSettled(ops);
 }
 
 function stripQuotes(s: string): string {

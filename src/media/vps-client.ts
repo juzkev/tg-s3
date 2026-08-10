@@ -89,26 +89,29 @@ export class VpsClient {
     });
   }
 
-  async proxyGet(fileId: string): Promise<Response> {
+  // timeoutMs defaults to the short proxy timeout (time-to-first-byte for small
+  // files). Large streamed bodies — e.g. a whole 2GB chunk on the chunked read
+  // path — pass VPS_LONG_TIMEOUT so the abort doesn't cut the transfer short.
+  async proxyGet(fileId: string, timeoutMs: number = VPS_PROXY_TIMEOUT): Promise<Response> {
     return this.withRetry(async () => {
       const res = await fetch(`${this.baseUrl}/api/proxy/get`, {
         method: 'POST',
         headers: this.headers(),
         body: JSON.stringify({ file_id: fileId }),
-        signal: AbortSignal.timeout(VPS_PROXY_TIMEOUT),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       if (!res.ok) throw new Error(`VPS proxy get failed: ${res.status}`);
       return res;
     });
   }
 
-  async proxyRange(fileId: string, start: number, end: number): Promise<Response> {
+  async proxyRange(fileId: string, start: number, end: number, timeoutMs: number = VPS_PROXY_TIMEOUT): Promise<Response> {
     return this.withRetry(async () => {
       const res = await fetch(`${this.baseUrl}/api/proxy/range`, {
         method: 'POST',
         headers: this.headers(),
         body: JSON.stringify({ file_id: fileId, start, end }),
-        signal: AbortSignal.timeout(VPS_PROXY_TIMEOUT),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       if (!res.ok) throw new Error(`VPS proxy range failed: ${res.status}`);
       return res;

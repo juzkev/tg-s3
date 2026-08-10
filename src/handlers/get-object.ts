@@ -5,7 +5,7 @@ import { uploadToTelegram } from '../telegram/upload';
 import { computeEtag } from '../utils/crypto';
 import { parseRange, isImageContentType, etagMatches, strip304Headers, buildResponseHeaders } from '../utils/headers';
 import { errorResponse } from '../xml/builder';
-import { BOT_API_GETFILE_LIMIT, R2_CACHE_MIN_SIZE, R2_CACHE_MAX_SIZE, CACHE_CONTROL_IMMUTABLE, CHUNKED_SENTINEL } from '../constants';
+import { BOT_API_GETFILE_LIMIT, R2_CACHE_MIN_SIZE, R2_CACHE_MAX_SIZE, CACHE_CONTROL_IMMUTABLE, CHUNKED_SENTINEL, VPS_LONG_TIMEOUT } from '../constants';
 import { VpsClient } from '../media/vps-client';
 import { parseSseCHeaders, validateKeyMd5, decrypt, isEncrypted, getStoredKeyMd5, addSseResponseHeaders, SseCError, isEncryptedS3, decryptS3, addSseS3ResponseHeaders } from '../utils/sse';
 import { selectChunksForRange } from '../utils/chunking';
@@ -495,13 +495,16 @@ function chunkThunk(
   return async () => {
     let res: Response;
     if (needsDecrypt) {
+      // get-decrypt already uses VPS_LONG_TIMEOUT internally.
       res = wholeChunk
         ? await vps.proxyGetDecrypt(chunk.tg_file_id, keyBase64!)
         : await vps.proxyGetDecrypt(chunk.tg_file_id, keyBase64!, localStart, localEnd);
     } else {
+      // A single chunk can be up to 2GB, so use the long timeout: the short proxy
+      // timeout would abort the streamed body mid-transfer on slower connections.
       res = wholeChunk
-        ? await vps.proxyGet(chunk.tg_file_id)
-        : await vps.proxyRange(chunk.tg_file_id, localStart, localEnd);
+        ? await vps.proxyGet(chunk.tg_file_id, VPS_LONG_TIMEOUT)
+        : await vps.proxyRange(chunk.tg_file_id, localStart, localEnd, VPS_LONG_TIMEOUT);
     }
     if (!res.body) throw new Error(`Chunk ${chunk.chunk_index} returned an empty body`);
     return res.body;

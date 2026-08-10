@@ -102,6 +102,27 @@ export class TelegramClient {
     });
   }
 
+  /**
+   * Bulk-delete up to 100 messages in a single chat with one API call (Telegram
+   * `deleteMessages`). Best-effort: resolves false rather than throwing on a
+   * non-OK response. Callers must chunk message_ids to <=100 per call.
+   */
+  async deleteMessages(chatId: string, messageIds: number[]): Promise<boolean> {
+    if (messageIds.length === 0) return true;
+    return this.withRetry(async () => {
+      const res = await fetch(`${this.baseUrl}/deleteMessages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, message_ids: messageIds }),
+        signal: AbortSignal.timeout(TG_API_TIMEOUT),
+      });
+      await this.checkFloodWait(res);
+      if (!res.ok) return false;
+      const data = await res.json() as { ok: boolean };
+      return data.ok;
+    });
+  }
+
   async forwardMessage(fromChatId: string, toChatId: string, messageId: number, messageThreadId?: number | null): Promise<TgMessageResponse> {
     return this.withRetry(async () => {
       const payload: Record<string, unknown> = { chat_id: toChatId, from_chat_id: fromChatId, message_id: messageId };
